@@ -9,13 +9,16 @@ module Lib.Anki.SQLite where
 import GHC.Generics   (Generic)
 
 import Data.Map                         (Map)
-import Data.Aeson                       (FromJSON(..), ToJSON(..), Value, (.:))
+import Data.Aeson                       (FromJSON(..), Value, (.:))
 import Data.Aeson.TH                    (Options(..))
 import Data.Aeson.Types                 (Parser)
-import Database.SQLite.Simple           (FromRow(..), ToRow(..), field)
+import Database.SQLite.Simple           (FromRow(..), ToRow(..), SQLData(SQLText), field)
+import Database.SQLite.Simple.Internal  (Field(..))
 import Database.SQLite.Simple.ToField   (ToField(..))
+import Database.SQLite.Simple.FromField (FromField(..), ResultError(ConversionFailed), returnError)
 
 import qualified Data.Text                  as T
+import qualified Data.ByteString.Lazy.Char8 as LBS
 import qualified Data.Aeson                 as J
 import qualified Data.Aeson.TH              as J
 import qualified Data.HashMap.Strict        as HashMap
@@ -41,6 +44,7 @@ parseModel (mid, json) =
       <$> (ModelId <$> (return $ read mid)) -- TODO readMay
       <*> (DeckId  <$> obj .: "did")
 
+type SQLiteDecksJSON = Map String SQLiteDeckJSON
 
 data SQLiteCollection = SQLiteCollection
   { sqlite_col_id     :: Int
@@ -51,10 +55,10 @@ data SQLiteCollection = SQLiteCollection
   , sqlite_col_dty    :: Int
   , sqlite_col_usn    :: Int
   , sqlite_col_ls     :: Int
-  , sqlite_col_conf   :: T.Text -- configuration of the collection
-  , sqlite_col_models :: T.Text -- models available in the collection
-  , sqlite_col_decks  :: T.Text -- decks of the collection
-  , sqlite_col_dconf  :: T.Text -- configuration of each deck
+  , sqlite_col_conf   :: T.Text          -- configuration of the collection
+  , sqlite_col_models :: T.Text          -- models available in the collection
+  , sqlite_col_decks  :: SQLiteDecksJSON -- decks of the collection
+  , sqlite_col_dconf  :: T.Text          -- configuration of each deck
   , sqlite_col_tags   :: T.Text
   }
 
@@ -109,15 +113,27 @@ data SQLiteDeckJSON = SQLiteDeckJSON
   , sqlite_deck_json_lrnToday  :: [Int]
   , sqlite_deck_json_id        :: Int
   , sqlite_deck_json_mod       :: Int
-  } deriving ( Generic )
+  } deriving ( Generic, Show )
 $(J.deriveJSON J.defaultOptions { fieldLabelModifier = drop 17 } ''SQLiteDeckJSON)
 
+instance FromField (Map String SQLiteDeckJSON) where
+  fromField f@(Field (SQLText t) _) =
+    case J.eitherDecode . LBS.pack . T.unpack $ t of
+      Left  err  -> returnError ConversionFailed f $ "SQLiteDeckJSON JSON parse error: " ++ err ++ "\n" ++ T.unpack t
+      Right deck -> return deck
 
-newtype SQLiteDecksJSON = SQLiteDecksJSON
-  { unDecksJSON :: Map String SQLiteDeckJSON
-  } deriving ( Generic )
-instance FromJSON SQLiteDecksJSON
-instance ToJSON   SQLiteDecksJSON
+  fromField f = returnError ConversionFailed f "expecting SQLText column type"
+
+instance ToField (Map String SQLiteDeckJSON) where
+  toField = SQLText . T.pack . LBS.unpack . J.encode
+
+
+-- -- TODO rm if compiles
+-- newtype SQLiteDecksJSON = SQLiteDecksJSON
+--   { unDecksJSON :: Map String SQLiteDeckJSON
+--   } deriving ( Generic )
+-- instance FromJSON SQLiteDecksJSON
+-- instance ToJSON   SQLiteDecksJSON
 
 
 -- http://downloads.haskell.org/~ghc/latest/docs/html/users_guide/using-warnings.html#ghc-flag--Wmissing-methods

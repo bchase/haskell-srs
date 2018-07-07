@@ -29,7 +29,7 @@ import qualified Database.SQLite.Simple     as SQLite
 
 import Lib.Anki.SQLite (NoteId(..), DeckId(..), ModelId(..), Model(..),
                         SQLiteCollection(..), SQLiteNote(..), SQLiteCard(..),
-                        SQLiteDeckJSON(..), SQLiteDecksJSON(..))
+                        SQLiteDeckJSON(..), SQLiteDecksJSON)
 
 
 type Video = FilePath
@@ -71,8 +71,10 @@ instance ToJSON MediaManifest where
 main :: IO ()
 main = do
   tmp <- mkTmpDir
-  _ <- cardsToAPKG "" (Just "example-tag") ("source/", tmp) []
-  return ()
+  eAPKG <- cardsToAPKG "NewDeckName" (Just "example-tag") ("source/", tmp) []
+  case eAPKG of
+    Left err   -> putStrLn $ "APKG failed: "  ++ err
+    Right apkg -> putStrLn $ "APKG created: " ++ apkg
 
   where
     mkTmpDir :: IO Dir -- TODO mv to .apkg func; delete tmp dir when done
@@ -83,8 +85,11 @@ main = do
       return dirName
 
 
+-- TODO EitherT
+-- TODO get rid of (Dir, Dir) by passing absolute paths to media?
+-- TODO newtype for `FilePath`s? (accidentally sqapped deck name & db path)
 cardsToAPKG :: DeckName -> Maybe Tag -> (Dir, Dir) -> [Card] -> IO (Either String FilePath)
-cardsToAPKG deckName mTag dirs origCards = do -- TODO EitherT
+cardsToAPKG deckName mTag dirs origCards = do
   let cards = tagCards origCards mTag
 
   ensureDirsExist dirs $ do
@@ -93,7 +98,7 @@ cardsToAPKG deckName mTag dirs origCards = do -- TODO EitherT
     writeMediaManifest dirs mediaManifest'
 
     db <- cpTemplateDB dirs
-    eOverwritten <- overwriteDeckName db deckName
+    eOverwritten <- overwriteDeckName deckName db
     case eOverwritten of
       Left  err -> return $ Left err
       Right c   -> do
@@ -107,7 +112,7 @@ cardsToAPKG deckName mTag dirs origCards = do -- TODO EitherT
   where
     cpTemplateDB :: (Dir, Dir) -> IO FilePath
     cpTemplateDB (_,dir) = do
-      let source = "files/collection.anki2" -- TODO
+      let source = "templates/collection.anki2"
           sink   = dir ++ "/collection.anki2"
       Dir.copyFile source sink
       return sink
@@ -118,29 +123,32 @@ cardsToAPKG deckName mTag dirs origCards = do -- TODO EitherT
       case cols of
         [col@SQLiteCollection{sqlite_col_decks}] -> do
           -- TODO change? -- sqlite_col_decks :: SQLiteDecksJSON
-          case J.decode . LBS.pack . T.unpack $ sqlite_col_decks of
-            Nothing    -> return $ Left "Failed to parse decks JSON"
-            Just decks -> do
-              case renameDeck name decks of
-                Left err     -> return $ Left err
-                Right decks' -> do
-                  let col' = col { sqlite_col_decks = T.pack . show . J.encode $ decks' }
-                  updateDecksOnCollection col' dbPath
-                  return $ Right col'
+          print . map sqlite_deck_json_name . map snd . Map.toList $ sqlite_col_decks
+          print sqlite_col_decks
+          case renameDeck name sqlite_col_decks of
+            Left err     -> return $ Left err
+            Right decks' -> do
+              let col' = col { sqlite_col_decks = decks' }
+              updateDecksOnCollection col' dbPath
+              return $ Right col'
         [] -> return $ Left "No collections in DB template"
         _  -> return $ Left "More than one collection in DB template"
 
         where
           renameDeck :: DeckName -> SQLiteDecksJSON -> Either String SQLiteDecksJSON
-          renameDeck n (SQLiteDecksJSON decks) =
+          -- renameDeck _ decks =
+          --   case Map.toList decks of
+          --     [_,(did, deck)] -> Right . Map.fromList $ [(did, deck { sqlite_deck_json_name = "export-template" })]
+          --     _             -> Left "More than 1 deck"
+          renameDeck n decks =
             case Map.toList decks of
-              [(did, deck)] -> Right . SQLiteDecksJSON . Map.fromList $ [(did, deck { sqlite_deck_json_name = n })]
+              [(did, deck)] -> Right . Map.fromList $ [(did, deck { sqlite_deck_json_name = n })]
               []            -> Left "No decks"
               _             -> Left "More than 1 deck"
 
           getCollections :: FilePath -> IO [SQLiteCollection]
           getCollections = do
-            flip sqlite3 $ flip SQLite.query_ "SELECT * FROM col;"
+            flip sqlite3 $ flip SQLite.query_ "SELECT * FROM col"
 
           updateDecksOnCollection :: SQLiteCollection -> FilePath -> IO ()
           updateDecksOnCollection SQLiteCollection{sqlite_col_id,sqlite_col_decks} = do
@@ -166,11 +174,6 @@ cardsToAPKG deckName mTag dirs origCards = do -- TODO EitherT
             mapM_ (SQLite.execute conn insertCard) cards
           return $ Right ()
 
-
-    ----- DONE -----
-
-    fail' = return . Left . (++) "Directories do not exist: \n" . intercalate "\n"
-
     tagCards :: [Card] -> Maybe Tag -> [Card]
     tagCards cs = maybe cs (flip tagCards' cs)
       where
@@ -180,6 +183,7 @@ cardsToAPKG deckName mTag dirs origCards = do -- TODO EitherT
 
     ensureDirsExist :: (Dir, Dir) -> IO (Either String FilePath) -> IO (Either String FilePath)
     ensureDirsExist (origin, dest) io = do
+      let fail' = return . Left . (++) "Directories do not exist: \n" . intercalate "\n"
       originAndDestExist <- (,)
         <$> Dir.doesDirectoryExist origin
         <*> Dir.doesDirectoryExist dest
@@ -261,7 +265,7 @@ buildDeck col cs = do
     Nothing      -> return $ Left invalidJSON
 
   where
-    parseColModel :: SQLiteCollection -> Maybe [Model]
+    parseColModel :: SQLiteCollection -> Maybe [Model] -- TODO eitherDecode
     parseColModel = J.decode . LBS.pack . T.unpack . sqlite_col_models
 
     buildDeck' :: Model -> Time.POSIXTime -> [Card] -> DeckForDB
