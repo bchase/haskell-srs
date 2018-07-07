@@ -12,19 +12,21 @@ import           Data.Monoid    ((<>), mempty)
 import           Data.Bifunctor (bimap)
 import           GHC.Generics   (Generic)
 
-import           Data.Aeson.Types            (Parser)
-import           Data.Aeson                  (FromJSON(..), ToJSON(..), Value,
-                                              (.=), (.:), pairs, encode, withObject, decode)
-import qualified Data.Text                   as T
-import qualified Data.HashMap.Strict         as HashMap
-import qualified Data.ByteString.Lazy.Char8  as BSL
-import qualified Data.ByteString.Char8       as BS
-import           Data.Time.Clock.POSIX       as Time
-import           System.Random               as Random
-import           System.Directory            as Dir
-import qualified Codec.Archive.Zip           as Zip
-import qualified Database.SQLite.Simple      as SQLite
-import qualified Crypto.Hash                 as Crypto
+import           Data.Aeson.Types               (Parser)
+import           Data.Aeson                     (FromJSON(..), ToJSON(..), Value,
+                                                 (.=), (.:), pairs, encode, withObject, decode)
+import qualified Data.Text                      as T
+import qualified Data.HashMap.Strict            as HashMap
+import qualified Data.ByteString.Lazy.Char8     as BSL
+import qualified Data.ByteString.Char8          as BS
+import           Data.Time.Clock.POSIX          as Time
+import           System.Random                  as Random
+import           System.Directory               as Dir
+import qualified Codec.Archive.Zip              as Zip
+import qualified Crypto.Hash                    as Crypto
+import qualified Database.SQLite.Simple         as SQLite
+import           Database.SQLite.Simple         (ToRow(..))
+import           Database.SQLite.Simple.ToField (ToField(..))
 
 
 type Video = FilePath
@@ -80,6 +82,8 @@ main = do
 writeDeck :: DeckName -> Maybe Tag -> (Dir, Dir) -> [Card] -> IO (Either String FilePath)
 writeDeck deckName mTag dirs origCards = do
   let cards = tagCards origCards mTag
+
+  -- mNotesAndCards <- buildDeck col cards
 
   ensureDirsExist dirs $ do
     let mediaManifest' = mediaManifest cards
@@ -165,6 +169,9 @@ writeDeck deckName mTag dirs origCards = do
 
 ---- GENERIC HELPERS ----
 
+posixSeconds :: Time.POSIXTime -> Int
+posixSeconds = fromInteger . round
+
 uniqSlug :: IO String
 uniqSlug = do
   rand <- return . show . abs =<< (Random.randomIO :: IO Int)
@@ -176,115 +183,40 @@ uniqSlug = do
 
 
 
--- sqlite> SELECT * FROM col;
--- id|crt|mod|scm|ver|dty|usn|ls|conf|models|decks|dconf|tags
--- 1|1530518400|1530820153785|1530820153766|11|0|0|0|{"nextPos": 1, "estTimes": true, "activeDecks": [1], "sortType": "noteFld", "timeLim": 0, "sortBackwards": false, "addToCur": true, "curDeck": 1, "newBury": true, "newSpread": 0, "dueCounts": true, "curModel": "1530820153767", "collapseTime": 1200}|{"1530549901640": {"vers": [], "name": "Basic", "tags": ["export-test-tag"], "did": 1530820024179, "usn": -1, "req": [[0, "all", [0]]], "flds": [{"name": "Front", "media": [], "sticky": false, "rtl": false, "ord": 0, "font": "Arial", "size": 20}, {"name": "Back", "media": [], "sticky": false, "rtl": false, "ord": 1, "font": "Arial", "size": 20}], "sortf": 0, "latexPre": "\\documentclass[12pt]{article}\n\\special{papersize=3in,5in}\n\\usepackage[utf8]{inputenc}\n\\usepackage{amssymb,amsmath}\n\\pagestyle{empty}\n\\setlength{\\parindent}{0in}\n\\begin{document}\n", "tmpls": [{"name": "Card 1", "qfmt": "{{Front}}", "did": null, "bafmt": "", "afmt": "{{FrontSide}}\n\n<hr id=answer>\n\n{{Back}}", "ord": 0, "bqfmt": ""}], "latexPost": "\\end{document}", "type": 0, "id": "1530549901640", "css": ".card {\n font-family: arial;\n font-size: 20px;\n text-align: center;\n color: black;\n background-color: white;\n}\n", "mod": 1530820114}}|{"1": {"desc": "", "name": "Default", "extendRev": 50, "usn": 0, "collapsed": false, "newToday": [0, 0], "timeToday": [0, 0], "dyn": 0, "extendNew": 10, "conf": 1, "revToday": [0, 0], "lrnToday": [0, 0], "id": 1, "mod": 1530820153}, "1530820024179": {"desc": "", "name": "export-test", "extendRev": 50, "usn": -1, "collapsed": false, "browserCollapsed": true, "newToday": [3, 0], "timeToday": [3, 0], "dyn": 0, "extendNew": 10, "conf": 1, "revToday": [3, 0], "lrnToday": [3, 0], "id": 1530820024179, "mod": 1530820114}}|{"1": {"name": "Default", "replayq": true, "lapse": {"leechFails": 8, "minInt": 1, "delays": [10], "leechAction": 0, "mult": 0}, "rev": {"perDay": 100, "fuzz": 0.05, "ivlFct": 1, "maxIvl": 36500, "ease4": 1.3, "bury": true, "minSpace": 1}, "timer": 0, "maxTaken": 60, "usn": 0, "new": {"perDay": 20, "delays": [1, 10], "separate": true, "ints": [1, 4, 7], "initialFactor": 2500, "bury": true, "order": 1}, "mod": 0, "id": 1, "autoplay": true}}|{}
+type DeckForDB = ([SQLiteNote], [SQLiteCard])
 
-
--- sqlite> .schema col
--- CREATE TABLE col (
---     id              integer primary key,
---     crt             integer not null,
---     mod             integer not null,
---     scm             integer not null,
---     ver             integer not null,
---     dty             integer not null,
---     usn             integer not null,
---     ls              integer not null,
---     conf            text not null,
---     models          text not null,
---     decks           text not null,
---     dconf           text not null,
---     tags            text not null
--- );
--- sqlite> .schema notes
--- CREATE TABLE notes (
---     id              integer primary key,   /* 0 */
---     guid            text not null,         /* 1 */
---     mid             integer not null,      /* 2 */
---     mod             integer not null,      /* 3 */
---     usn             integer not null,      /* 4 */
---     tags            text not null,         /* 5 */
---     flds            text not null,         /* 6 */
---     sfld            integer not null,      /* 7 */
---     csum            integer not null,      /* 8 */
---     flags           integer not null,      /* 9 */
---     data            text not null          /* 10 */
--- );
--- CREATE INDEX ix_notes_usn on notes (usn);
--- CREATE INDEX ix_notes_csum on notes (csum);
--- sqlite> .schema cards
--- CREATE TABLE cards (
---     id              integer primary key,   /* 0 */
---     nid             integer not null,      /* 1 */
---     did             integer not null,      /* 2 */
---     ord             integer not null,      /* 3 */
---     mod             integer not null,      /* 4 */
---     usn             integer not null,      /* 5 */
---     type            integer not null,      /* 6 */
---     queue           integer not null,      /* 7 */
---     due             integer not null,      /* 8 */
---     ivl             integer not null,      /* 9 */
---     factor          integer not null,      /* 10 */
---     reps            integer not null,      /* 11 */
---     lapses          integer not null,      /* 12 */
---     left            integer not null,      /* 13 */
---     odue            integer not null,      /* 14 */
---     odid            integer not null,      /* 15 */
---     flags           integer not null,      /* 16 */
---     data            text not null          /* 17 */
--- );
--- CREATE INDEX ix_cards_usn on cards (usn);
--- CREATE INDEX ix_cards_nid on cards (nid);
--- CREATE INDEX ix_cards_sched on cards (did, queue, due);
-
-
--- cardFront :: Card -> T.Text
--- cardFront Card{..} =
--- cardBack :: Card -> T.Text
--- cardBack Card{..} =
-
-
-
--- buildNotes :: [Card] -> IO [SQLiteNote]
--- buildNotes cards = do
---   time <- Time.getPOSIXTime
---
---   let cards' = map
-
-type DeckForDB = (SQLiteCollection, [SQLiteNote])
-
-createDeck :: SQLiteCollection -> [Card] -> IO (Either String DeckForDB)
-createDeck col cards = do
+buildDeck :: SQLiteCollection -> [Card] -> IO (Either String DeckForDB)
+buildDeck col cs = do
   time <- getPOSIXTime
 
-  case parseMIDs col of
-    Just [mid] -> return $ Right (col, buildNotes time mid cards)
-    Just _     -> return $ Left notSingleModel
-    Nothing    -> return $ Left invalidJSON
+  case parseColModel col of
+    Just [model] -> return . Right $ buildDeck' model time cs
+    Just _       -> return $ Left notSingleModel
+    Nothing      -> return $ Left invalidJSON
 
   where
-    parseMIDs :: SQLiteCollection -> Maybe [AnkiModelId]
-    parseMIDs = fmap (map ankiModelId) . decode . BSL.pack . T.unpack . sqlite_col_models
+    parseColModel :: SQLiteCollection -> Maybe [Model]
+    parseColModel = decode . BSL.pack . T.unpack . sqlite_col_models
+
+    buildDeck' :: Model -> Time.POSIXTime -> [Card] -> DeckForDB
+    buildDeck' Model{modelId, deckId} t cs' =
+      let seconds = posixSeconds t
+          cardsWithIDs = map (bimap (NoteId . (+seconds)) id) . zip [0..] $ cs'
+          notes = map (buildNote modelId t) cardsWithIDs
+          cards = map (buildCard deckId  t) cardsWithIDs
+       in (notes, cards)
 
     notSingleModel = "Should be only 1 model in `sqlite_col_models`, were "
     invalidJSON    = "`sqlite_col_models` did not have a valid JSON schema"
 
 
-buildNotes :: Time.POSIXTime -> AnkiModelId -> [Card] -> [SQLiteNote]
-buildNotes time mid = map (uncurry (note mid time)) . zip [0..]
-
-
-note :: AnkiModelId -> Time.POSIXTime -> Int -> Card -> SQLiteNote
-note (AnkiModelId mid) time idx Card{..} = do
-  let mod' = fromInteger . round $ time
-      id'  = mod' + idx
-
+buildNote :: ModelId -> Time.POSIXTime -> (NoteId,Card) -> SQLiteNote
+buildNote (ModelId mid') t (NoteId nid, Card{..}) = do
   SQLiteNote -- SEE DEF BELOW FOR EXPLANATION
-    { sqlite_note_id    = mod' + id'
-    , sqlite_note_guid  = T.pack . show $ id'
-    , sqlite_note_mid   = mid
-    , sqlite_note_mod   = mod'
+    { sqlite_note_id    = nid
+    , sqlite_note_guid  = T.pack . show $ nid
+    , sqlite_note_mid   = mid'
+    , sqlite_note_mod   = posixSeconds t
     , sqlite_note_usn   = -1
     , sqlite_note_tags  = T.pack $ intercalate "," cardTags
     , sqlite_note_flds  = T.pack $ cardFront ++ "\x1F" ++ cardBack
@@ -299,45 +231,64 @@ note (AnkiModelId mid) time idx Card{..} = do
     sha1 = Crypto.hash . BS.pack
 
 
+buildCard :: DeckId -> Time.POSIXTime -> (NoteId, Card) -> SQLiteCard
+buildCard (DeckId did) time (NoteId nid, _) =
+  SQLiteCard
+    { sqlite_card_id     = nid
+    , sqlite_card_nid    = nid
+    , sqlite_card_did    = did
+    , sqlite_card_ord    = 0
+    , sqlite_card_mod    = posixSeconds time
+    , sqlite_card_usn    = -1
+    , sqlite_card_type   = 0
+    , sqlite_card_queue  = 0
+    , sqlite_card_due    = 484332854 -- TODO ?????
+    , sqlite_card_ivl    = 0
+    , sqlite_card_factor = 0
+    , sqlite_card_reps   = 0
+    , sqlite_card_lapses = 0
+    , sqlite_card_left   = 0
+    , sqlite_card_odue   = 0
+    , sqlite_card_odid   = 0
+    , sqlite_card_flags  = 0
+    , sqlite_card_data   = ""
+    }
 
 
 
+newtype NoteId  = NoteId  { unNoteId  :: Int }
+newtype DeckId  = DeckId  { unDeckId  :: Int }
+newtype ModelId = ModelId { unModelId :: Int }
 
-
-
-
-data AnkiModel = AnkiModel
-  { ankiModelId :: AnkiModelId
-  , ankiDeckId  :: AnkiDeckId
+data Model = Model
+  { modelId :: ModelId
+  , deckId  :: DeckId
   }
--- data AnkiModel = AnkiModel AnkiModelId AnkiDeckId
-newtype AnkiDeckId  = AnkiDeckId  { unAnkiDeckId  :: Int }
-newtype AnkiModelId = AnkiModelId { unAnkiModelId :: Int }
 
 -- https://stackoverflow.com/questions/42578331/aeson-parse-json-with-unknown-key-in-haskell
-instance {-# OVERLAPS #-} FromJSON [AnkiModel] where -- TODO OVERLAPS
+instance {-# OVERLAPS #-} FromJSON [Model] where -- TODO OVERLAPS
   parseJSON x = parseJSON x >>= mapM parseModel . HashMap.toList
-parseModel :: (String, Value) -> Parser AnkiModel
+parseModel :: (String, Value) -> Parser Model
 parseModel (mid, json) =
-  flip (withObject "AnkiModelId") json $ \obj ->
-    AnkiModel
-      <$> (AnkiModelId <$> (return $ read mid)) -- TODO readMay
-      <*> (AnkiDeckId  <$> obj .: "did")
+  flip (withObject "ModelId") json $ \obj ->
+    Model
+      <$> (ModelId <$> (return $ read mid)) -- TODO readMay
+      <*> (DeckId  <$> obj .: "did")
 
 
 data SQLiteCollection = SQLiteCollection
   { sqlite_col_id     :: Int
-  , sqlite_col_crt    :: Int
-  , sqlite_col_mod    :: Int
-  , sqlite_col_scm    :: Int
+  , sqlite_col_crt    :: Int    -- crt ("created"?)
+  , sqlite_col_mod    :: Int    -- mod ("modified"?)
+  , sqlite_col_scm    :: Int    -- scm (another UNIX time)
   , sqlite_col_ver    :: Int
   , sqlite_col_dty    :: Int
   , sqlite_col_usn    :: Int
   , sqlite_col_ls     :: Int
-  , sqlite_col_conf   :: T.Text
-  , sqlite_col_models :: T.Text
-  , sqlite_col_decks  :: T.Text
-  , sqlite_col_dconf  :: T.Text
+  , sqlite_col_conf   :: T.Text -- configuration of the collection
+  , sqlite_col_models :: T.Text -- models available in the collection
+  , sqlite_col_decks  :: T.Text -- decks of the collection. first is "default", second is target deck
+  , sqlite_col_dconf  :: T.Text -- configuration of each deck
   , sqlite_col_tags   :: T.Text
   }
 
@@ -355,23 +306,10 @@ data SQLiteNote = SQLiteNote     -- <<< http://decks.wikia.com/wiki/Anki_APKG_fo
   , sqlite_note_data  :: T.Text  -- ((empty))
   }
 
--- instance SQLite.ToRow SQLiteNote where
---   id_
---   guid
---   mid
---   mod
---   usn
---   tags
---   flds
---   sfld
---   csum
---   flags
---   data_
-
 data SQLiteCard = SQLiteCard
-  { sqlite_card_id     :: Int
-  , sqlite_card_nid    :: Int
-  , sqlite_card_did    :: Int
+  { sqlite_card_id     :: Int -- card ID, generate randomly
+  , sqlite_card_nid    :: Int -- note ID
+  , sqlite_card_did    :: Int -- deck ID, per `models` JSON on collection (`col` row)
   , sqlite_card_ord    :: Int
   , sqlite_card_mod    :: Int
   , sqlite_card_usn    :: Int
@@ -388,3 +326,42 @@ data SQLiteCard = SQLiteCard
   , sqlite_card_flags  :: Int
   , sqlite_card_data   :: T.Text
   }
+
+instance ToRow SQLiteNote where
+  toRow SQLiteNote{..} =
+    toRow
+      [ toField sqlite_note_id
+      , toField sqlite_note_guid
+      , toField sqlite_note_mid
+      , toField sqlite_note_mod
+      , toField sqlite_note_usn
+      , toField sqlite_note_tags
+      , toField sqlite_note_flds
+      , toField sqlite_note_sfld
+      , toField sqlite_note_csum
+      , toField sqlite_note_flags
+      , toField sqlite_note_data
+      ]
+
+instance ToRow SQLiteCard where
+  toRow SQLiteCard{..} =
+    toRow
+      [ toField sqlite_card_id
+      , toField sqlite_card_nid
+      , toField sqlite_card_did
+      , toField sqlite_card_ord
+      , toField sqlite_card_mod
+      , toField sqlite_card_usn
+      , toField sqlite_card_type
+      , toField sqlite_card_queue
+      , toField sqlite_card_due
+      , toField sqlite_card_ivl
+      , toField sqlite_card_factor
+      , toField sqlite_card_reps
+      , toField sqlite_card_lapses
+      , toField sqlite_card_left
+      , toField sqlite_card_odue
+      , toField sqlite_card_odid
+      , toField sqlite_card_flags
+      , toField sqlite_card_data
+      ]
