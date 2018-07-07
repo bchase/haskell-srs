@@ -1,5 +1,6 @@
 {-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE DeriveGeneric     #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
 
@@ -11,8 +12,11 @@ import           Data.Monoid    ((<>), mempty)
 import           Data.Bifunctor (bimap)
 import           GHC.Generics   (Generic)
 
+import           Data.Aeson.Types            (Parser)
+import           Data.Aeson                  (FromJSON(..), ToJSON(..), Value,
+                                              (.=), (.:), pairs, encode, withObject, decode)
 import qualified Data.Text                   as T
-import           Data.Aeson                  (ToJSON(toEncoding), (.=), pairs, encode)
+import qualified Data.HashMap.Strict         as HashMap
 import qualified Data.ByteString.Lazy.Char8  as BSL
 import qualified Data.ByteString.Char8       as BS
 import           Data.Time.Clock.POSIX       as Time
@@ -248,40 +252,51 @@ uniqSlug = do
 --
 --   let cards' = map
 
+type DeckForDB = (SQLiteCollection, [SQLiteNote])
+
+createDeck :: SQLiteCollection -> [Card] -> IO (Either String DeckForDB)
+createDeck col cards = do
+  time <- getPOSIXTime
+
+  case parseMIDs col of
+    Just [mid] -> return $ Right (col, buildNotes time mid cards)
+    Just _     -> return $ Left notSingleModel
+    Nothing    -> return $ Left invalidJSON
+
+  where
+    parseMIDs :: SQLiteCollection -> Maybe [AnkiModelId]
+    parseMIDs = fmap (map ankiModelId) . decode . BSL.pack . T.unpack . sqlite_col_models
+
+    notSingleModel = "Should be only 1 model in `sqlite_col_models`, were "
+    invalidJSON    = "`sqlite_col_models` did not have a valid JSON schema"
 
 
+buildNotes :: Time.POSIXTime -> AnkiModelId -> [Card] -> [SQLiteNote]
+buildNotes time mid = map (uncurry (note mid time)) . zip [0..]
 
-sha1 :: String -> String
-sha1 str = show (Crypto.hash (BS.pack str) :: Crypto.Digest Crypto.SHA1)
 
-
-note :: Time.POSIXTime -> Int -> Card -> SQLiteNote
-note time idx Card{..} = do
-  -- BUILD FROM CARD
-  let tags         = T.pack $ intercalate "," cardTags
-      frontAndBack = T.pack $ cardFront ++ "\x1F" ++ cardBack
-      frontNoHTML  = T.pack $ cardFrontNoHTML
-
+note :: AnkiModelId -> Time.POSIXTime -> Int -> Card -> SQLiteNote
+note (AnkiModelId mid) time idx Card{..} = do
   let mod' = fromInteger . round $ time
       id'  = mod' + idx
-      guid = T.pack . show $ id'
-      mid  = 0 -- TODO get from JSON
-      frontSHA1    = sha1 frontNoHTML
 
-  SQLiteNote
-    { sqlite_note_id    = id'          -- the note id, generate it randomly.
-    , sqlite_note_guid  = guid         -- a GUID identifier, generate it randomly.
-    , sqlite_note_mid   = mid          -- identifier of the model, use the one found in the models JSON section.
-    , sqlite_note_mod   = mod'         -- replace with current time (seconds since 1970).
-    , sqlite_note_usn   = -1           -- default
-    , sqlite_note_tags  = tags         -- tags, visible to the user, which can be used to filter cards (e.g. "verb")
-    , sqlite_note_flds  = frontAndBack -- card content, front and back, separated by \x1f char.
-    , sqlite_note_sfld  = frontNoHTML  -- card front content without html (first part of flds, filtered).
-    , sqlite_note_csum  = frontSHA1    -- a string SHA1 checksum of sfld, limited to 8 digits
-    , sqlite_note_flags = 0            -- default
-    , sqlite_note_data  = ""           -- empty
+  SQLiteNote -- SEE DEF BELOW FOR EXPLANATION
+    { sqlite_note_id    = mod' + id'
+    , sqlite_note_guid  = T.pack . show $ id'
+    , sqlite_note_mid   = mid
+    , sqlite_note_mod   = mod'
+    , sqlite_note_usn   = -1
+    , sqlite_note_tags  = T.pack $ intercalate "," cardTags
+    , sqlite_note_flds  = T.pack $ cardFront ++ "\x1F" ++ cardBack
+    , sqlite_note_sfld  = T.pack $ cardFrontNoHTML
+    , sqlite_note_csum  = T.pack . show . sha1 $ cardFrontNoHTML
+    , sqlite_note_flags = 0
+    , sqlite_note_data  = ""
     }
 
+  where
+    sha1 :: String -> Crypto.Digest Crypto.SHA1
+    sha1 = Crypto.hash . BS.pack
 
 
 
@@ -291,20 +306,54 @@ note time idx Card{..} = do
 
 
 
+data AnkiModel = AnkiModel
+  { ankiModelId :: AnkiModelId
+  , ankiDeckId  :: AnkiDeckId
+  }
+-- data AnkiModel = AnkiModel AnkiModelId AnkiDeckId
+newtype AnkiDeckId  = AnkiDeckId  { unAnkiDeckId  :: Int }
+newtype AnkiModelId = AnkiModelId { unAnkiModelId :: Int }
 
-data SQLiteNote = SQLiteNote
-  { sqlite_note_id    :: Int
-  , sqlite_note_guid  :: T.Text
-  , sqlite_note_mid   :: Int
-  , sqlite_note_mod   :: Int
-  , sqlite_note_usn   :: Int
-  , sqlite_note_tags  :: T.Text
-  , sqlite_note_flds  :: T.Text
-  , sqlite_note_sfld  :: T.Text
-  , sqlite_note_csum  :: Int
-  , sqlite_note_flags :: Int
-  , sqlite_note_data  :: T.Text
-  } deriving ( Generic )
+-- https://stackoverflow.com/questions/42578331/aeson-parse-json-with-unknown-key-in-haskell
+instance {-# OVERLAPS #-} FromJSON [AnkiModel] where -- TODO OVERLAPS
+  parseJSON x = parseJSON x >>= mapM parseModel . HashMap.toList
+parseModel :: (String, Value) -> Parser AnkiModel
+parseModel (mid, json) =
+  flip (withObject "AnkiModelId") json $ \obj ->
+    AnkiModel
+      <$> (AnkiModelId <$> (return $ read mid)) -- TODO readMay
+      <*> (AnkiDeckId  <$> obj .: "did")
+
+
+data SQLiteCollection = SQLiteCollection
+  { sqlite_col_id     :: Int
+  , sqlite_col_crt    :: Int
+  , sqlite_col_mod    :: Int
+  , sqlite_col_scm    :: Int
+  , sqlite_col_ver    :: Int
+  , sqlite_col_dty    :: Int
+  , sqlite_col_usn    :: Int
+  , sqlite_col_ls     :: Int
+  , sqlite_col_conf   :: T.Text
+  , sqlite_col_models :: T.Text
+  , sqlite_col_decks  :: T.Text
+  , sqlite_col_dconf  :: T.Text
+  , sqlite_col_tags   :: T.Text
+  }
+
+data SQLiteNote = SQLiteNote     -- <<< http://decks.wikia.com/wiki/Anki_APKG_format_documentation >>>
+  { sqlite_note_id    :: Int     -- the note id, generate it randomly.
+  , sqlite_note_guid  :: T.Text  -- a GUID identifier, generate it randomly.
+  , sqlite_note_mid   :: Int     -- identifier of the model, use the one found in the models JSON section.
+  , sqlite_note_mod   :: Int     -- replace with current time (seconds since 1970).
+  , sqlite_note_usn   :: Int     -- ((default))
+  , sqlite_note_tags  :: T.Text  -- tags, visible to the user, which can be used to filter cards (e.g. "verb")
+  , sqlite_note_flds  :: T.Text  -- card content, front and back, separated by \x1f char.
+  , sqlite_note_sfld  :: T.Text  -- card front content without html (first part of flds, filtered).
+  , sqlite_note_csum  :: T.Text  -- a string SHA1 checksum of sfld, limited to 8 digits
+  , sqlite_note_flags :: Int     -- ((default))
+  , sqlite_note_data  :: T.Text  -- ((empty))
+  }
 
 -- instance SQLite.ToRow SQLiteNote where
 --   id_
@@ -319,23 +368,23 @@ data SQLiteNote = SQLiteNote
 --   flags
 --   data_
 
--- data SQLiteCard = SQLiteCard
---   { sqlite_card_id     :: Int
---   , sqlite_card_nid    :: Int
---   , sqlite_card_did    :: Int
---   , sqlite_card_ord    :: Int
---   , sqlite_card_mod    :: Int
---   , sqlite_card_usn    :: Int
---   , sqlite_card_type   :: Int
---   , sqlite_card_queue  :: Int
---   , sqlite_card_due    :: Int
---   , sqlite_card_ivl    :: Int
---   , sqlite_card_factor :: Int
---   , sqlite_card_reps   :: Int
---   , sqlite_card_lapses :: Int
---   , sqlite_card_left   :: Int
---   , sqlite_card_odue   :: Int
---   , sqlite_card_odid   :: Int
---   , sqlite_card_flags  :: Int
---   , sqlite_card_data   :: T.Text
---   } deriving ( Generic )
+data SQLiteCard = SQLiteCard
+  { sqlite_card_id     :: Int
+  , sqlite_card_nid    :: Int
+  , sqlite_card_did    :: Int
+  , sqlite_card_ord    :: Int
+  , sqlite_card_mod    :: Int
+  , sqlite_card_usn    :: Int
+  , sqlite_card_type   :: Int
+  , sqlite_card_queue  :: Int
+  , sqlite_card_due    :: Int
+  , sqlite_card_ivl    :: Int
+  , sqlite_card_factor :: Int
+  , sqlite_card_reps   :: Int
+  , sqlite_card_lapses :: Int
+  , sqlite_card_left   :: Int
+  , sqlite_card_odue   :: Int
+  , sqlite_card_odid   :: Int
+  , sqlite_card_flags  :: Int
+  , sqlite_card_data   :: T.Text
+  }
