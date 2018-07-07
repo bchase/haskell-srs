@@ -1,32 +1,35 @@
-{-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE DeriveGeneric     #-}
+{-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
 
 module Lib where
 
-import           Data.Char      (toLower)
-import           Data.List      (intercalate)
-import           Data.Monoid    ((<>), mempty)
-import           Data.Bifunctor (bimap)
-import           GHC.Generics   (Generic)
+import Data.Char      (toLower)
+import Data.List      (intercalate)
+import Data.Monoid    ((<>), mempty)
+import Data.Bifunctor (bimap)
+import GHC.Generics   (Generic)
 
-import           Data.Aeson.Types               (Parser)
-import           Data.Aeson                     (FromJSON(..), ToJSON(..), Value,
-                                                 (.=), (.:), pairs, encode, withObject, decode)
-import qualified Data.Text                      as T
-import qualified Data.HashMap.Strict            as HashMap
-import qualified Data.ByteString.Lazy.Char8     as BSL
-import qualified Data.ByteString.Char8          as BS
-import           Data.Time.Clock.POSIX          as Time
-import           System.Random                  as Random
-import           System.Directory               as Dir
-import qualified Codec.Archive.Zip              as Zip
-import qualified Crypto.Hash                    as Crypto
-import qualified Database.SQLite.Simple         as SQLite
-import           Database.SQLite.Simple         (ToRow(..))
-import           Database.SQLite.Simple.ToField (ToField(..))
+import Data.Aeson             (ToJSON(..), (.=))
+import Database.SQLite.Simple (NamedParam((:=)))
+
+import qualified Data.Aeson                 as J
+import qualified Data.Text                  as T
+import qualified Data.Map                   as Map
+import qualified Data.ByteString.Lazy.Char8 as LBS
+import qualified Data.ByteString.Char8      as BS
+import qualified Data.Time.Clock.POSIX      as Time
+import qualified System.Random              as Random
+import qualified System.Directory           as Dir
+import qualified Codec.Archive.Zip          as Zip
+import qualified Crypto.Hash                as Crypto
+import qualified Database.SQLite.Simple     as SQLite
+
+import Lib.Anki.SQLite (NoteId(..), DeckId(..), ModelId(..), Model(..),
+                        SQLiteCollection(..), SQLiteNote(..), SQLiteCard(..),
+                        SQLiteDeckJSON(..), SQLiteDecksJSON(..))
 
 
 type Video = FilePath
@@ -61,54 +64,114 @@ manifestPairs :: MediaManifest -> [(String, Video)]
 manifestPairs = map (bimap show id) . zip ([0..] :: [Int]) . unMediaManifest
 
 instance ToJSON MediaManifest where
-  toEncoding = pairs . foldl (\json (n,f) -> (n .= f) <> json) mempty . map (bimap T.pack id) . manifestPairs
+  toEncoding = J.pairs . foldl (\json (n,f) -> (n .= f) <> json) mempty . map (bimap T.pack id) . manifestPairs
 
 
 
 main :: IO ()
 main = do
   tmp <- mkTmpDir
-  _ <- writeDeck "" (Just "example-tag") ("source/", tmp) []
+  _ <- cardsToAPKG "" (Just "example-tag") ("source/", tmp) []
   return ()
 
   where
-    mkTmpDir :: IO Dir
+    mkTmpDir :: IO Dir -- TODO mv to .apkg func; delete tmp dir when done
     mkTmpDir = do
-      dirName <- uniqSlug
+      slug <- uniqSlug
+      let dirName = "/tmp/anki-hs-" ++ slug
       Dir.createDirectory dirName
       return dirName
 
 
-writeDeck :: DeckName -> Maybe Tag -> (Dir, Dir) -> [Card] -> IO (Either String FilePath)
-writeDeck deckName mTag dirs origCards = do
+cardsToAPKG :: DeckName -> Maybe Tag -> (Dir, Dir) -> [Card] -> IO (Either String FilePath)
+cardsToAPKG deckName mTag dirs origCards = do
   let cards = tagCards origCards mTag
 
-  -- mNotesAndCards <- buildDeck col cards
-
+  -- TODO EitherT
   ensureDirsExist dirs $ do
     let mediaManifest' = mediaManifest cards
     cpMediaFiles dirs mediaManifest'
     writeMediaManifest dirs mediaManifest'
 
-    writeDeckSqlite3 dirs deckName cards
-
-    mkAPKG dirs deckName >>= return . Right -- TODO Eithers
+    db <- cpTemplateDB dirs
+    eOverwritten <- overwriteDeckName db deckName
+    case eOverwritten of
+      Left  err -> return $ Left err
+      Right c   -> do
+        eWritten <- writeCollection db c cards
+        case eWritten of
+          Left err -> return $ Left err
+          Right () -> do
+            apkgPath <- mkAPKG dirs deckName
+            return $ Right apkgPath
 
   where
-    writeDeckSqlite3 :: (Dir, Dir) -> DeckName -> [Card] -> IO ()
-    writeDeckSqlite3 _ _ _ = do
-      -- let sep = "\x1F"
-      let createTableCmds = []
-      --     insertCollection = ""
-      --     insertNotes = ""
-      --     insertCards = ""
-      --
-      conn <- SQLite.open "TODO.db" -- TODO .db
-      mapM_ (SQLite.execute_ conn) createTableCmds
-      -- SQLite.execute conn insertCollection
-      -- mapM_ (SQLite.execute  conn) insertNotes
-      -- mapM_ (SQLite.execute  conn) insertCards
-      SQLite.close conn
+    cpTemplateDB :: (Dir, Dir) -> IO FilePath
+    cpTemplateDB (_,dir) = do
+      let source = "files/collection.anki2" -- TODO
+          sink   = dir ++ "/collection.anki2"
+      Dir.copyFile source sink
+      return sink
+
+    overwriteDeckName :: DeckName -> FilePath -> IO (Either String SQLiteCollection)
+    overwriteDeckName name dbPath = do
+      cols <- getCollections dbPath
+      case cols of
+        [col@SQLiteCollection{sqlite_col_decks}] -> do
+          -- TODO change? -- sqlite_col_decks :: SQLiteDecksJSON
+          case J.decode . LBS.pack . T.unpack $ sqlite_col_decks of
+            Nothing    -> return $ Left "Failed to parse decks JSON"
+            Just decks -> do
+              case renameDeck name decks of
+                Left err     -> return $ Left err
+                Right decks' -> do
+                  let col' = col { sqlite_col_decks = T.pack . show . J.encode $ decks' }
+                  updateDecksOnCollection col' dbPath
+                  return $ Right col'
+        [] -> return $ Left "No collections in DB template"
+        _  -> return $ Left "More than one collection in DB template"
+
+        where
+          renameDeck :: DeckName -> SQLiteDecksJSON -> Either String SQLiteDecksJSON
+          renameDeck n (SQLiteDecksJSON decks) =
+            case Map.toList decks of
+              [(did, deck)] -> Right . SQLiteDecksJSON . Map.fromList $ [(did, deck { sqlite_deck_json_name = n })]
+              []            -> Left "No decks"
+              _             -> Left "More than 1 deck"
+
+          getCollections :: FilePath -> IO [SQLiteCollection]
+          getCollections = do
+            flip sqlite3 $ flip SQLite.query_ "SELECT * FROM col;"
+
+          updateDecksOnCollection :: SQLiteCollection -> FilePath -> IO ()
+          updateDecksOnCollection SQLiteCollection{sqlite_col_id,sqlite_col_decks} = do
+            flip sqlite3 $ \conn -> do
+              SQLite.executeNamed conn
+                "UPDATE col SET decks = :decks WHERE id = :id"
+                [ ":id"    := sqlite_col_id
+                , ":decks" := sqlite_col_decks
+                ]
+
+
+
+
+    writeCollection :: FilePath -> SQLiteCollection -> [Card] -> IO (Either String ())
+    writeCollection dbPath col cards = do
+      eNotesAndCards <- buildDeck col cards -- TODO mv logic here
+      case eNotesAndCards of
+        Left  err            -> return $ Left err
+        Right (_, _) -> do
+          let createTableCmds = [] -- TODO rm
+          --    updateCollection = ""
+          --     insertNotes = ""
+          --     insertCards = ""
+
+          sqlite3 dbPath $ \conn -> do
+            mapM_ (SQLite.execute_ conn) createTableCmds
+            -- SQLite.execute conn updateCollection
+            -- mapM_ (SQLite.execute  conn) insertNotes
+            -- mapM_ (SQLite.execute  conn) insertCards
+          return $ Right ()
 
 
     ----- DONE -----
@@ -138,7 +201,7 @@ writeDeck deckName mTag dirs origCards = do
 
     writeMediaManifest :: (Dir, Dir) -> MediaManifest -> IO ()
     writeMediaManifest (_, sink) manifest = do
-      BSL.writeFile (sink ++ "/media") (encode manifest)
+      LBS.writeFile (sink ++ "/media") (J.encode manifest)
 
     -- TODO copyFile throws if file DNE
     cpMediaFiles :: (Dir, Dir) -> MediaManifest -> IO ()
@@ -181,13 +244,23 @@ uniqSlug = do
 
   return $ time' ++ "--" ++ rand
 
+sqlite3 :: FilePath -> (SQLite.Connection -> IO a) -> IO a
+sqlite3 sqlite3File runQueries = do
+  conn <- SQLite.open sqlite3File
+  x <- runQueries conn
+  SQLite.close conn
+  return x
 
+
+
+
+---- SQLite ----
 
 type DeckForDB = ([SQLiteNote], [SQLiteCard])
 
 buildDeck :: SQLiteCollection -> [Card] -> IO (Either String DeckForDB)
 buildDeck col cs = do
-  time <- getPOSIXTime
+  time <- Time.getPOSIXTime
 
   case parseColModel col of
     Just [model] -> return . Right $ buildDeck' model time cs
@@ -196,7 +269,7 @@ buildDeck col cs = do
 
   where
     parseColModel :: SQLiteCollection -> Maybe [Model]
-    parseColModel = decode . BSL.pack . T.unpack . sqlite_col_models
+    parseColModel = J.decode . LBS.pack . T.unpack . sqlite_col_models
 
     buildDeck' :: Model -> Time.POSIXTime -> [Card] -> DeckForDB
     buildDeck' Model{modelId, deckId} t cs' =
@@ -253,115 +326,3 @@ buildCard (DeckId did) time (NoteId nid, _) =
     , sqlite_card_flags  = 0
     , sqlite_card_data   = ""
     }
-
-
-
-newtype NoteId  = NoteId  { unNoteId  :: Int }
-newtype DeckId  = DeckId  { unDeckId  :: Int }
-newtype ModelId = ModelId { unModelId :: Int }
-
-data Model = Model
-  { modelId :: ModelId
-  , deckId  :: DeckId
-  }
-
--- https://stackoverflow.com/questions/42578331/aeson-parse-json-with-unknown-key-in-haskell
-instance {-# OVERLAPS #-} FromJSON [Model] where -- TODO OVERLAPS
-  parseJSON x = parseJSON x >>= mapM parseModel . HashMap.toList
-parseModel :: (String, Value) -> Parser Model
-parseModel (mid, json) =
-  flip (withObject "ModelId") json $ \obj ->
-    Model
-      <$> (ModelId <$> (return $ read mid)) -- TODO readMay
-      <*> (DeckId  <$> obj .: "did")
-
-
-data SQLiteCollection = SQLiteCollection
-  { sqlite_col_id     :: Int
-  , sqlite_col_crt    :: Int    -- crt ("created"?)
-  , sqlite_col_mod    :: Int    -- mod ("modified"?)
-  , sqlite_col_scm    :: Int    -- scm (another UNIX time)
-  , sqlite_col_ver    :: Int
-  , sqlite_col_dty    :: Int
-  , sqlite_col_usn    :: Int
-  , sqlite_col_ls     :: Int
-  , sqlite_col_conf   :: T.Text -- configuration of the collection
-  , sqlite_col_models :: T.Text -- models available in the collection
-  , sqlite_col_decks  :: T.Text -- decks of the collection. first is "default", second is target deck
-  , sqlite_col_dconf  :: T.Text -- configuration of each deck
-  , sqlite_col_tags   :: T.Text
-  }
-
-data SQLiteNote = SQLiteNote     -- <<< http://decks.wikia.com/wiki/Anki_APKG_format_documentation >>>
-  { sqlite_note_id    :: Int     -- the note id, generate it randomly.
-  , sqlite_note_guid  :: T.Text  -- a GUID identifier, generate it randomly.
-  , sqlite_note_mid   :: Int     -- identifier of the model, use the one found in the models JSON section.
-  , sqlite_note_mod   :: Int     -- replace with current time (seconds since 1970).
-  , sqlite_note_usn   :: Int     -- ((default))
-  , sqlite_note_tags  :: T.Text  -- tags, visible to the user, which can be used to filter cards (e.g. "verb")
-  , sqlite_note_flds  :: T.Text  -- card content, front and back, separated by \x1f char.
-  , sqlite_note_sfld  :: T.Text  -- card front content without html (first part of flds, filtered).
-  , sqlite_note_csum  :: T.Text  -- a string SHA1 checksum of sfld, limited to 8 digits
-  , sqlite_note_flags :: Int     -- ((default))
-  , sqlite_note_data  :: T.Text  -- ((empty))
-  }
-
-data SQLiteCard = SQLiteCard
-  { sqlite_card_id     :: Int -- card ID, generate randomly
-  , sqlite_card_nid    :: Int -- note ID
-  , sqlite_card_did    :: Int -- deck ID, per `models` JSON on collection (`col` row)
-  , sqlite_card_ord    :: Int
-  , sqlite_card_mod    :: Int
-  , sqlite_card_usn    :: Int
-  , sqlite_card_type   :: Int
-  , sqlite_card_queue  :: Int
-  , sqlite_card_due    :: Int
-  , sqlite_card_ivl    :: Int
-  , sqlite_card_factor :: Int
-  , sqlite_card_reps   :: Int
-  , sqlite_card_lapses :: Int
-  , sqlite_card_left   :: Int
-  , sqlite_card_odue   :: Int
-  , sqlite_card_odid   :: Int
-  , sqlite_card_flags  :: Int
-  , sqlite_card_data   :: T.Text
-  }
-
-instance ToRow SQLiteNote where
-  toRow SQLiteNote{..} =
-    toRow
-      [ toField sqlite_note_id
-      , toField sqlite_note_guid
-      , toField sqlite_note_mid
-      , toField sqlite_note_mod
-      , toField sqlite_note_usn
-      , toField sqlite_note_tags
-      , toField sqlite_note_flds
-      , toField sqlite_note_sfld
-      , toField sqlite_note_csum
-      , toField sqlite_note_flags
-      , toField sqlite_note_data
-      ]
-
-instance ToRow SQLiteCard where
-  toRow SQLiteCard{..} =
-    toRow
-      [ toField sqlite_card_id
-      , toField sqlite_card_nid
-      , toField sqlite_card_did
-      , toField sqlite_card_ord
-      , toField sqlite_card_mod
-      , toField sqlite_card_usn
-      , toField sqlite_card_type
-      , toField sqlite_card_queue
-      , toField sqlite_card_due
-      , toField sqlite_card_ivl
-      , toField sqlite_card_factor
-      , toField sqlite_card_reps
-      , toField sqlite_card_lapses
-      , toField sqlite_card_left
-      , toField sqlite_card_odue
-      , toField sqlite_card_odid
-      , toField sqlite_card_flags
-      , toField sqlite_card_data
-      ]

@@ -33,6 +33,7 @@ library:
     - containers
     - cryptonite >= 0.25 && < 0.26
     - directory
+    - filepath
     - random
     - sqlite-simple >= 0.4.16.0 && < 0.4.17
     - text
