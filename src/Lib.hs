@@ -84,10 +84,9 @@ main = do
 
 
 cardsToAPKG :: DeckName -> Maybe Tag -> (Dir, Dir) -> [Card] -> IO (Either String FilePath)
-cardsToAPKG deckName mTag dirs origCards = do
+cardsToAPKG deckName mTag dirs origCards = do -- TODO EitherT
   let cards = tagCards origCards mTag
 
-  -- TODO EitherT
   ensureDirsExist dirs $ do
     let mediaManifest' = mediaManifest cards
     cpMediaFiles dirs mediaManifest'
@@ -153,24 +152,18 @@ cardsToAPKG deckName mTag dirs origCards = do
                 ]
 
 
-
-
     writeCollection :: FilePath -> SQLiteCollection -> [Card] -> IO (Either String ())
-    writeCollection dbPath col cards = do
-      eNotesAndCards <- buildDeck col cards -- TODO mv logic here
+    writeCollection dbPath col cs = do
+      eNotesAndCards <- buildDeck col cs -- TODO mv logic here
       case eNotesAndCards of
-        Left  err            -> return $ Left err
-        Right (_, _) -> do
-          let createTableCmds = [] -- TODO rm
-          --    updateCollection = ""
-          --     insertNotes = ""
-          --     insertCards = ""
+        Left  err    -> return $ Left err
+        Right (notes, cards) -> do
+          let insertNote = "INSERT INTO notes VALUES (?,?,?,?,?,?,?,?,?,?,?)"               :: SQLite.Query
+              insertCard = "INSERT INTO cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" :: SQLite.Query
 
           sqlite3 dbPath $ \conn -> do
-            mapM_ (SQLite.execute_ conn) createTableCmds
-            -- SQLite.execute conn updateCollection
-            -- mapM_ (SQLite.execute  conn) insertNotes
-            -- mapM_ (SQLite.execute  conn) insertCards
+            mapM_ (SQLite.execute conn insertNote) notes
+            mapM_ (SQLite.execute conn insertCard) cards
           return $ Right ()
 
 
