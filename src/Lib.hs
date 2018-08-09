@@ -70,8 +70,16 @@ instance ToJSON MediaManifest where
 
 main :: IO ()
 main = do
+  let card = Card { cardFront       = "front"
+                  , cardFrontNoHTML = "front-no-html"
+                  , cardBack        = "back"
+                  , cardTags        = [""]
+                  , cardMedia       = []
+                  }
+
   tmp <- mkTmpDir
-  eAPKG <- cardsToAPKG "NewDeckName" (Just "example-tag") ("source/", tmp) []
+  -- TODO blows up with trailing slash for source dir
+  eAPKG <- cardsToAPKG "NewDeckName" (Just "example-tag") ("source", tmp) [ card ]
   case eAPKG of
     Left err   -> putStrLn $ "APKG failed: "  ++ err
     Right apkg -> putStrLn $ "APKG created: " ++ apkg
@@ -80,7 +88,7 @@ main = do
     mkTmpDir :: IO Dir -- TODO mv to .apkg func; delete tmp dir when done
     mkTmpDir = do
       slug <- uniqSlug
-      let dirName = "/tmp/anki-hs-" ++ slug
+      let dirName = "tmp/" ++ slug
       Dir.createDirectory dirName
       return dirName
 
@@ -123,8 +131,6 @@ cardsToAPKG deckName mTag dirs origCards = do
       case cols of
         [col@SQLiteCollection{sqlite_col_decks}] -> do
           -- TODO change? -- sqlite_col_decks :: SQLiteDecksJSON
-          print . map sqlite_deck_json_name . map snd . Map.toList $ sqlite_col_decks
-          print sqlite_col_decks
           case renameDeck name sqlite_col_decks of
             Left err     -> return $ Left err
             Right decks' -> do
@@ -206,23 +212,27 @@ cardsToAPKG deckName mTag dirs origCards = do
       mapM_ (\(num, fp) -> Dir.copyFile (source ++ "/" ++ fp) (sink ++ "/" ++ num)) . manifestPairs
 
     mkAPKG :: (Dir, Dir) -> DeckName -> IO FilePath
-    mkAPKG (dir, _) name = do
-      slug <- uniqSlug
-
-      let normalize = map (\c -> if c `elem` ['a'..'z'] then c else '-') . map toLower
-          apkgPath = flip (++) ("--" ++ slug ++ ".apkg") . normalize $ name
-
-      contents <- Dir.getDirectoryContents dir
-
+    mkAPKG (_, dir) name = genUniqApkgName name >>= \apkgPath -> do
       -- TODO
       --   - (Zip library) MonadThrow if invalid -- http://hackage.haskell.org/package/zip-1.1.0/docs/Codec-Archive-Zip.html#v:mkEntrySelector
       --   - (application) check all necessary files exist (including media)
-      files <- mapM (\file -> Zip.mkEntrySelector $ dir ++ "/" ++ file) contents
 
-      _ <- Zip.createArchive apkgPath $ do
-        mapM (Zip.addEntry Zip.Store (BS.pack "")) files
+      Dir.withCurrentDirectory dir $ do
+        let files = [ "collection.anki2", "media" ] -- TODO media files
 
-      return apkgPath
+        files' <- mapM (\f -> (,) <$> Zip.mkEntrySelector f <*> BS.readFile f) files -- TODO handle file DNE case
+
+        _ <- Zip.createArchive apkgPath $ do
+          mapM (\(esel, contents) -> Zip.addEntry Zip.Deflate contents esel) files'
+
+        -- TODO (own and) clean up tmp dir
+
+        return apkgPath
+
+    genUniqApkgName :: String -> IO String
+    genUniqApkgName name = uniqSlug >>= \slug -> do
+      let normalize = map (\c -> if c `elem` ['a'..'z'] then c else '-') . map toLower
+      return $ normalize name ++ "--" ++ slug ++ ".apkg"
 
 
 
