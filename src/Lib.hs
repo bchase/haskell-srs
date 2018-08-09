@@ -217,17 +217,20 @@ cardsToAPKG deckName mTag dirs origCards = do
       --   - (Zip library) MonadThrow if invalid -- http://hackage.haskell.org/package/zip-1.1.0/docs/Codec-Archive-Zip.html#v:mkEntrySelector
       --   - (application) check all necessary files exist (including media)
 
-      Dir.withCurrentDirectory dir $ do
+      _ <- Dir.withCurrentDirectory dir $ do
         let files = [ "collection.anki2", "media" ] -- TODO media files
 
         files' <- mapM (\f -> (,) <$> Zip.mkEntrySelector f <*> BS.readFile f) files -- TODO handle file DNE case
 
-        _ <- Zip.createArchive apkgPath $ do
+        Zip.createArchive apkgPath $ do
           mapM (\(esel, contents) -> Zip.addEntry Zip.Deflate contents esel) files'
 
-        -- TODO (own and) clean up tmp dir
+      Dir.copyFile (dir ++ "/" ++ apkgPath) ("tmp/" ++ apkgPath) -- TODO ensure `tmp/`?
+      Dir.removeDirectoryRecursive dir
 
-        return apkgPath
+      pwd <- Dir.getCurrentDirectory
+      return $ pwd ++ "/tmp/" ++ apkgPath
+
 
     genUniqApkgName :: String -> IO String
     genUniqApkgName name = uniqSlug >>= \slug -> do
