@@ -2,7 +2,7 @@
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 2d679c7060a6c59a25221f8dfe518055d0fd8e027d3020afcd168a23941132a5
+-- hash: d48c40ba5e18cf2cf96954238d917d972a4c043ca83195bfe2927a56e36e8490
 
 name:           anki-haskell
 version:        0.1.0.0
@@ -45,6 +45,7 @@ library
     , sqlite-simple >=0.4.16.0 && <0.4.17
     , text
     , time
+    , transformers >=0.5.2.0 && <0.5.3
     , unordered-containers
     , zip >=1.0.0 && <1.1
   default-language: Haskell2010

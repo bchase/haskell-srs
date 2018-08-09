@@ -6,14 +6,16 @@
 
 module Lib where
 
-import Data.Char      (toLower)
+import Data.Char      (isAlpha, toLower)
 import Data.List      (intercalate)
 import Data.Monoid    ((<>), mempty)
 import Data.Bifunctor (bimap)
 import GHC.Generics   (Generic)
 
-import Data.Aeson             (ToJSON(..), (.=))
-import Database.SQLite.Simple (NamedParam((:=)))
+import Data.Aeson                 (ToJSON(..), (.=))
+import Database.SQLite.Simple     (NamedParam((:=)))
+import Control.Monad.Trans.Class  (lift)
+import Control.Monad.Trans.Except (ExceptT(ExceptT), runExceptT)
 
 import qualified Data.Aeson                 as J
 import qualified Data.Text                  as T
@@ -93,9 +95,8 @@ main = do
       return dirName
 
 
--- TODO EitherT
 -- TODO get rid of (Dir, Dir) by passing absolute paths to media?
--- TODO newtype for `FilePath`s? (accidentally sqapped deck name & db path)
+-- TODO newtype for `FilePath`s? (accidentally swapped deck name & db path)
 cardsToAPKG :: DeckName -> Maybe Tag -> (Dir, Dir) -> [Card] -> IO (Either String FilePath)
 cardsToAPKG deckName mTag dirs origCards = do
   let cards = tagCards origCards mTag
@@ -104,18 +105,12 @@ cardsToAPKG deckName mTag dirs origCards = do
     let mediaManifest' = mediaManifest cards
     cpMediaFiles dirs mediaManifest'
     writeMediaManifest dirs mediaManifest'
-
     db <- cpTemplateDB dirs
-    eOverwritten <- overwriteDeckName deckName db
-    case eOverwritten of
-      Left  err -> return $ Left err
-      Right c   -> do
-        eWritten <- writeCollection db c cards
-        case eWritten of
-          Left err -> return $ Left err
-          Right () -> do
-            apkgPath <- mkAPKG dirs deckName
-            return $ Right apkgPath
+
+    runExceptT $ do
+      col <- ExceptT $ overwriteDeckName deckName db
+      ()  <- ExceptT $ writeCollection db col cards
+      lift $ mkAPKG dirs deckName
 
   where
     cpTemplateDB :: (Dir, Dir) -> IO FilePath
@@ -220,10 +215,10 @@ cardsToAPKG deckName mTag dirs origCards = do
       _ <- Dir.withCurrentDirectory dir $ do
         let files = [ "collection.anki2", "media" ] -- TODO media files
 
-        files' <- mapM (\f -> (,) <$> Zip.mkEntrySelector f <*> BS.readFile f) files -- TODO handle file DNE case
+        files' <- mapM (\f -> (,) <$> BS.readFile f <*> Zip.mkEntrySelector f) files -- TODO handle file DNE case
 
         Zip.createArchive apkgPath $ do
-          mapM (\(esel, contents) -> Zip.addEntry Zip.Deflate contents esel) files'
+          mapM (uncurry $ Zip.addEntry Zip.Deflate) files'
 
       Dir.copyFile (dir ++ "/" ++ apkgPath) ("tmp/" ++ apkgPath) -- TODO ensure `tmp/`?
       Dir.removeDirectoryRecursive dir
@@ -234,7 +229,7 @@ cardsToAPKG deckName mTag dirs origCards = do
 
     genUniqApkgName :: String -> IO String
     genUniqApkgName name = uniqSlug >>= \slug -> do
-      let normalize = map (\c -> if c `elem` ['a'..'z'] then c else '-') . map toLower
+      let normalize = map (\c -> if isAlpha c then c else '-') . map toLower
       return $ normalize name ++ "--" ++ slug ++ ".apkg"
 
 
