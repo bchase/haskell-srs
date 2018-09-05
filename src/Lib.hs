@@ -7,7 +7,7 @@
 module Lib where
 
 import Data.Char      (isAlpha, toLower)
-import Data.List      (intercalate)
+import Data.List      (intercalate, nub)
 import Data.Monoid    ((<>), mempty)
 import Data.Bifunctor (bimap)
 import GHC.Generics   (Generic)
@@ -44,7 +44,7 @@ type DeckName = String
 data VideoCard = VideoCard
   { videoCardSubs       :: Maybe String
   , videoCardGlosses    :: [Gloss]
-  , videoCardTags       :: [Tag]
+  , videoCardTags       :: [Tag] -- TODO Set Tag
   , videoCardFrontVideo :: Video
   , videoCardFrontText  :: Maybe String
   , videoCardBackText   :: Maybe String
@@ -80,7 +80,7 @@ main = do
                   }
 
   -- TODO blows up with trailing slash for source dir
-  eAPKG <- cardsToAPKG "NewDeckName" Nothing "source" [ card ]
+  eAPKG <- cardsToAPKG "NewDeckName" [] "source" [ card ]
   case eAPKG of
     Left err   -> putStrLn $ "APKG failed: "  ++ err
     Right apkg -> putStrLn $ "APKG created: " ++ apkg
@@ -88,9 +88,9 @@ main = do
 
 -- TODO get rid of (Dir, Dir) by passing absolute paths to media?
 -- TODO newtype for `FilePath`s? (accidentally swapped deck name & db path)
-cardsToAPKG :: DeckName -> Maybe Tag -> Dir -> [Card] -> IO (Either String FilePath)
-cardsToAPKG deckName mTag mediaDir origCards = do
-  let cards = tagCards origCards mTag -- TODO plural tags, right? ... Maybe -> List
+cardsToAPKG :: DeckName -> [Tag] -> Dir -> [Card] -> IO (Either String FilePath)
+cardsToAPKG deckName tags mediaDir origCards = do
+  let cards = tagCards tags origCards
 
   tmp <- mkTmpDir
   -- TODO use `Exception`s in general, but particularly here w/ FS I/O
@@ -165,12 +165,8 @@ cardsToAPKG deckName mTag mediaDir origCards = do
             mapM_ (SQLite.execute conn insertCard) cards
           return $ Right ()
 
-    tagCards :: [Card] -> Maybe Tag -> [Card]
-    tagCards cs = maybe cs (flip tagCards' cs)
-      where
-        tagCards' :: Tag -> [Card] -> [Card]
-        tagCards' tag =
-          map (\card@Card{cardTags} -> card { cardTags = tag:cardTags })
+    tagCards :: [Tag] -> [Card] -> [Card]
+    tagCards ts = map (\card@Card{cardTags} -> card { cardTags = nub $ ts ++ cardTags })
 
     ensureDirsExist :: (Dir, Dir) -> IO (Either String FilePath) -> IO (Either String FilePath)
     ensureDirsExist (origin, dest) io = do
