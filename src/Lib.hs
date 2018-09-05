@@ -78,17 +78,14 @@ instance ToCard AudioCard where
 
 newtype MediaManifest = MediaManifest { unMediaManifest :: [FilePath] } deriving ( Generic )
 
-manifestPairs :: MediaManifest -> [(String, FilePath)]
-manifestPairs = map (bimap show id) . zip ([0..] :: [Int]) . unMediaManifest
-
 instance ToJSON MediaManifest where
-  toEncoding = J.pairs . foldl (\json (n,f) -> (n .= f) <> json) mempty . map (bimap T.pack id) . manifestPairs
+  toEncoding = J.pairs . foldl (\json fp -> let f = FP.takeFileName fp in (T.pack f .= f) <> json) mempty . unMediaManifest
 
 
 
 main :: IO ()
 main = do
-  let card = AudioCard { audioCardFrontAudio  = "boof.mp3"
+  let card = AudioCard { audioCardFrontAudio  = "/home/bosco/dev/srs/source/boof.mp3"
                        , audioCardFrontNoHTML = "front-no-html"
                        , audioCardBack        = "back"
                        , audioCardTags        = []
@@ -101,7 +98,6 @@ main = do
     Right apkg -> putStrLn $ "APKG created: " ++ apkg
 
 
--- TODO get rid of (Dir, Dir) by passing absolute paths to media?
 -- TODO newtype for `FilePath`s? (accidentally swapped deck name & db path)
 toAPKG :: (ToCard c) => DeckName -> [Tag] -> Dir -> [c] -> IO (Either String FilePath)
 toAPKG deckName tags mediaDir xs = do
@@ -113,7 +109,6 @@ toAPKG deckName tags mediaDir xs = do
   ensureDirsExist (mediaDir, tmp) $ do
     let mediaManifest' = mediaManifest cards
 
-    cpMediaFiles (mediaDir, tmp) mediaManifest'
     writeMediaManifest tmp mediaManifest'
     db <- cpTemplateDB tmp
 
@@ -200,13 +195,7 @@ toAPKG deckName tags mediaDir xs = do
     mediaManifest = MediaManifest . concat . map cardMedia
 
     writeMediaManifest :: Dir -> MediaManifest -> IO ()
-    writeMediaManifest sink manifest = do
-      LBS.writeFile (sink ++ "/media") (J.encode manifest)
-
-    -- TODO copyFile throws if file DNE
-    cpMediaFiles :: (Dir, Dir) -> MediaManifest -> IO ()
-    cpMediaFiles (source, sink) =
-      mapM_ (\(num, fp) -> Dir.copyFile (source ++ "/" ++ fp) (sink ++ "/" ++ num)) . manifestPairs
+    writeMediaManifest sink manifest = LBS.writeFile (sink ++ "/media") (J.encode manifest)
 
     mkAPKG :: Dir -> DeckName -> IO FilePath
     mkAPKG dir name = genUniqApkgName name >>= \apkgName -> do
@@ -215,8 +204,7 @@ toAPKG deckName tags mediaDir xs = do
       --   - (application) check all necessary files exist (including media)
 
       _ <- Dir.withCurrentDirectory dir $ do
-        let files = [ "collection.anki2", "media" ] -- TODO media files
-
+        files <- Dir.listDirectory dir
         files' <- mapM (\f -> (,) <$> BS.readFile f <*> Zip.mkEntrySelector f) files -- TODO handle file DNE case
 
         Zip.createArchive apkgName $ do
