@@ -25,6 +25,7 @@ import qualified Data.ByteString.Char8      as BS
 import qualified Data.Time.Clock.POSIX      as Time
 import qualified System.Random              as Random
 import qualified System.Directory           as Dir
+import qualified System.FilePath.Posix      as FP
 import qualified Codec.Archive.Zip          as Zip
 import qualified Crypto.Hash                as Crypto
 import qualified Database.SQLite.Simple     as SQLite
@@ -33,36 +34,51 @@ import Lib.Anki.SQLite (NoteId(..), DeckId(..), ModelId(..), Model(..),
                         SQLiteCollection(..), SQLiteNote(..), SQLiteCard(..),
                         SQLiteDeckJSON(..), SQLiteDecksJSON)
 
+-- TODO FP.joinPath instead of `++ "/"` (throughout)
 
-type Video = FilePath
 type Dir = FilePath
 
 type Tag = String
 type Gloss = String
 type DeckName = String
 
-data VideoCard = VideoCard
-  { videoCardSubs       :: Maybe String
-  , videoCardGlosses    :: [Gloss]
-  , videoCardTags       :: [Tag] -- TODO Set Tag
-  , videoCardFrontVideo :: Video
-  , videoCardFrontText  :: Maybe String
-  , videoCardBackText   :: Maybe String
+data AudioCard = AudioCard
+  { audioCardFrontAudio  :: FilePath
+  , audioCardFrontNoHTML :: String
+  , audioCardBack        :: String
+  , audioCardTags        :: [Tag]
   }
 
-data Card = Card
+data Card = Card -- ready for APKG
   { cardFront       :: String
   , cardFrontNoHTML :: String
   , cardBack        :: String
-  , cardTags        :: [Tag]
+  , cardTags        :: [Tag] -- TODO Set Tag
   , cardMedia       :: [FilePath]
   }
 
+class ToCard c where
+  mvMediaAndConvertCards :: Dir -> [c] -> IO [Card]
+
+instance ToCard AudioCard where
+  mvMediaAndConvertCards dir cs = map mkCard <$> mvMediaFiles cs
+    where
+      mvMediaFiles = mapM mvAndUpdatePath . zip [0..]
+
+      mvAndUpdatePath (idx, card@AudioCard{audioCardFrontAudio}) = do
+        let dest = FP.joinPath [dir, show (idx :: Int)]
+        Dir.copyFile audioCardFrontAudio dest
+        return $ card { audioCardFrontAudio = dest }
+
+      mkCard AudioCard{..} =
+        let front = "[sound:" ++ FP.takeFileName audioCardFrontAudio ++ "]"
+         in Card front audioCardFrontNoHTML audioCardBack audioCardTags [ audioCardFrontAudio ]
 
 
-newtype MediaManifest = MediaManifest { unMediaManifest :: [Video] } deriving ( Generic )
 
-manifestPairs :: MediaManifest -> [(String, Video)]
+newtype MediaManifest = MediaManifest { unMediaManifest :: [FilePath] } deriving ( Generic )
+
+manifestPairs :: MediaManifest -> [(String, FilePath)]
 manifestPairs = map (bimap show id) . zip ([0..] :: [Int]) . unMediaManifest
 
 instance ToJSON MediaManifest where
@@ -72,15 +88,14 @@ instance ToJSON MediaManifest where
 
 main :: IO ()
 main = do
-  let card = Card { cardFront       = "front"
-                  , cardFrontNoHTML = "front-no-html"
-                  , cardBack        = "back"
-                  , cardTags        = []
-                  , cardMedia       = []
-                  }
+  let card = AudioCard { audioCardFrontAudio  = "boof.mp3"
+                       , audioCardFrontNoHTML = "front-no-html"
+                       , audioCardBack        = "back"
+                       , audioCardTags        = []
+                       }
 
   -- TODO blows up with trailing slash for source dir
-  eAPKG <- cardsToAPKG "NewDeckName" [] "source" [ card ]
+  eAPKG <- toAPKG "NewDeckName" [] "source" [ card ]
   case eAPKG of
     Left err   -> putStrLn $ "APKG failed: "  ++ err
     Right apkg -> putStrLn $ "APKG created: " ++ apkg
@@ -88,11 +103,12 @@ main = do
 
 -- TODO get rid of (Dir, Dir) by passing absolute paths to media?
 -- TODO newtype for `FilePath`s? (accidentally swapped deck name & db path)
-cardsToAPKG :: DeckName -> [Tag] -> Dir -> [Card] -> IO (Either String FilePath)
-cardsToAPKG deckName tags mediaDir origCards = do
-  let cards = tagCards tags origCards
-
+toAPKG :: (ToCard c) => DeckName -> [Tag] -> Dir -> [c] -> IO (Either String FilePath)
+toAPKG deckName tags mediaDir xs = do
   tmp <- mkTmpDir
+
+  cards <- tagCards tags <$> mvMediaAndConvertCards tmp xs
+
   -- TODO use `Exception`s in general, but particularly here w/ FS I/O
   ensureDirsExist (mediaDir, tmp) $ do
     let mediaManifest' = mediaManifest cards
