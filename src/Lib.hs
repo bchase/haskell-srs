@@ -75,46 +75,40 @@ main = do
   let card = Card { cardFront       = "front"
                   , cardFrontNoHTML = "front-no-html"
                   , cardBack        = "back"
-                  , cardTags        = [""]
+                  , cardTags        = []
                   , cardMedia       = []
                   }
 
-  tmp <- mkTmpDir
   -- TODO blows up with trailing slash for source dir
-  eAPKG <- cardsToAPKG "NewDeckName" (Just "example-tag") ("source", tmp) [ card ]
+  eAPKG <- cardsToAPKG "NewDeckName" Nothing "source" [ card ]
   case eAPKG of
     Left err   -> putStrLn $ "APKG failed: "  ++ err
     Right apkg -> putStrLn $ "APKG created: " ++ apkg
 
-  where
-    mkTmpDir :: IO Dir -- TODO mv to .apkg func; delete tmp dir when done
-    mkTmpDir = do
-      slug <- uniqSlug
-      let dirName = "tmp/" ++ slug
-      Dir.createDirectory dirName
-      return dirName
-
 
 -- TODO get rid of (Dir, Dir) by passing absolute paths to media?
 -- TODO newtype for `FilePath`s? (accidentally swapped deck name & db path)
-cardsToAPKG :: DeckName -> Maybe Tag -> (Dir, Dir) -> [Card] -> IO (Either String FilePath)
-cardsToAPKG deckName mTag dirs origCards = do
-  let cards = tagCards origCards mTag
+cardsToAPKG :: DeckName -> Maybe Tag -> Dir -> [Card] -> IO (Either String FilePath)
+cardsToAPKG deckName mTag mediaDir origCards = do
+  let cards = tagCards origCards mTag -- TODO plural tags, right? ... Maybe -> List
 
-  ensureDirsExist dirs $ do
+  tmp <- mkTmpDir
+  -- TODO use `Exception`s in general, but particularly here w/ FS I/O
+  ensureDirsExist (mediaDir, tmp) $ do
     let mediaManifest' = mediaManifest cards
-    cpMediaFiles dirs mediaManifest'
-    writeMediaManifest dirs mediaManifest'
-    db <- cpTemplateDB dirs
+
+    cpMediaFiles (mediaDir, tmp) mediaManifest'
+    writeMediaManifest tmp mediaManifest'
+    db <- cpTemplateDB tmp
 
     runExceptT $ do
       col <- ExceptT $ overwriteDeckName deckName db
       ()  <- ExceptT $ writeCollection db col cards
-      lift $ mkAPKG dirs deckName
+      lift $ mkAPKG tmp deckName
 
   where
-    cpTemplateDB :: (Dir, Dir) -> IO FilePath
-    cpTemplateDB (_,dir) = do
+    cpTemplateDB :: Dir -> IO FilePath
+    cpTemplateDB dir = do
       let source = "templates/collection.anki2"
           sink   = dir ++ "/collection.anki2"
       Dir.copyFile source sink
@@ -137,10 +131,6 @@ cardsToAPKG deckName mTag dirs origCards = do
 
         where
           renameDeck :: DeckName -> SQLiteDecksJSON -> Either String SQLiteDecksJSON
-          -- renameDeck _ decks =
-          --   case Map.toList decks of
-          --     [_,(did, deck)] -> Right . Map.fromList $ [(did, deck { sqlite_deck_json_name = "export-template" })]
-          --     _             -> Left "More than 1 deck"
           renameDeck n decks =
             case Map.toList decks of
               [(did, deck)] -> Right . Map.fromList $ [(did, deck { sqlite_deck_json_name = n })]
@@ -197,8 +187,8 @@ cardsToAPKG deckName mTag dirs origCards = do
     mediaManifest :: [Card] -> MediaManifest
     mediaManifest = MediaManifest . concat . map cardMedia
 
-    writeMediaManifest :: (Dir, Dir) -> MediaManifest -> IO ()
-    writeMediaManifest (_, sink) manifest = do
+    writeMediaManifest :: Dir -> MediaManifest -> IO ()
+    writeMediaManifest sink manifest = do
       LBS.writeFile (sink ++ "/media") (J.encode manifest)
 
     -- TODO copyFile throws if file DNE
@@ -206,8 +196,8 @@ cardsToAPKG deckName mTag dirs origCards = do
     cpMediaFiles (source, sink) =
       mapM_ (\(num, fp) -> Dir.copyFile (source ++ "/" ++ fp) (sink ++ "/" ++ num)) . manifestPairs
 
-    mkAPKG :: (Dir, Dir) -> DeckName -> IO FilePath
-    mkAPKG (_, dir) name = genUniqApkgName name >>= \apkgPath -> do
+    mkAPKG :: Dir -> DeckName -> IO FilePath
+    mkAPKG dir name = genUniqApkgName name >>= \apkgName -> do
       -- TODO
       --   - (Zip library) MonadThrow if invalid -- http://hackage.haskell.org/package/zip-1.1.0/docs/Codec-Archive-Zip.html#v:mkEntrySelector
       --   - (application) check all necessary files exist (including media)
@@ -217,14 +207,10 @@ cardsToAPKG deckName mTag dirs origCards = do
 
         files' <- mapM (\f -> (,) <$> BS.readFile f <*> Zip.mkEntrySelector f) files -- TODO handle file DNE case
 
-        Zip.createArchive apkgPath $ do
+        Zip.createArchive apkgName $ do
           mapM (uncurry $ Zip.addEntry Zip.Deflate) files'
 
-      Dir.copyFile (dir ++ "/" ++ apkgPath) ("tmp/" ++ apkgPath) -- TODO ensure `tmp/`?
-      Dir.removeDirectoryRecursive dir
-
-      pwd <- Dir.getCurrentDirectory
-      return $ pwd ++ "/tmp/" ++ apkgPath
+      return $ dir ++ "/" ++ apkgName
 
 
     genUniqApkgName :: String -> IO String
@@ -239,6 +225,13 @@ cardsToAPKG deckName mTag dirs origCards = do
 
 posixSeconds :: Time.POSIXTime -> Int
 posixSeconds = fromInteger . round
+
+mkTmpDir :: IO Dir
+mkTmpDir = do
+  slug <- uniqSlug
+  let dirName = "/tmp/anki-hs-" ++ slug
+  Dir.createDirectory dirName
+  return dirName
 
 uniqSlug :: IO String
 uniqSlug = do
